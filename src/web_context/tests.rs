@@ -42,7 +42,7 @@ impl Drop for Fixture {
 async fn fixture() -> Fixture {
     let service = Service::default();
     let router = Router::new()
-        .route("/mcp", post(mcp))
+        .route("/mcp", post(mcp).delete(mcp_delete))
         .route("/deepseek", post(deepseek))
         .route("/anthropic", post(anthropic))
         .with_state(service.clone());
@@ -74,12 +74,12 @@ async fn mcp(
     record(&s, "mcp", headers, &body);
     let method = body["method"].as_str().unwrap();
     let behavior = s.behavior.load(Ordering::SeqCst);
-    if method == "notifications/initialized" {
+    if method == "notifications/initialized" || method == "notifications/cancelled" {
         return StatusCode::ACCEPTED.into_response();
     }
     let result = match method {
         "initialize" => {
-            json!({"protocolVersion":PROTOCOL, "capabilities":{"tools":{}}, "serverInfo":{"name":"fixture", "version":"1"}})
+            json!({"protocolVersion":if behavior == 12 { "unsupported" } else { PROTOCOL }, "capabilities":{"tools":{}}, "serverInfo":{"name":"fixture", "version":"1"}})
         }
         "tools/list" => json!({"tools":[{"name":"web_search"}, {"name":"web_fetch"}]}),
         "tools/call" => {
@@ -103,7 +103,9 @@ async fn mcp(
         _ => panic!("unexpected method"),
     };
     let reply = json!({"jsonrpc":"2.0", "id":body["id"], "result":result});
-    let mut response = if behavior == 5 {
+    let mut response = if behavior == 11 && method == "initialize" {
+        "malformed handshake".into_response()
+    } else if behavior == 5 {
         ([("content-type", "text/event-stream")], format!("event: message\r\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}}\r\n\r\nevent: message\r\ndata: {reply}\r\n\r\n")).into_response()
     } else {
         Json(reply).into_response()
@@ -114,6 +116,18 @@ async fn mcp(
             .insert("Mcp-Session-Id", "fixture-session".parse().unwrap());
     }
     response
+}
+
+async fn mcp_delete(State(s): State<Service>, headers: HeaderMap) -> StatusCode {
+    record(&s, "mcp_delete", headers, &Value::Null);
+    match s.behavior.load(Ordering::SeqCst) {
+        9 => StatusCode::METHOD_NOT_ALLOWED,
+        10 => {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            StatusCode::OK
+        }
+        _ => StatusCode::OK,
+    }
 }
 
 fn deepseek_reply(stream: bool) -> Value {
@@ -230,6 +244,9 @@ async fn actual_chat_handlers_ground_both_models_for_search_and_fetch() {
             let records = f.service.records.lock().unwrap();
             let mcp: Vec<_> = records.iter().filter(|r| r.path == "mcp").collect();
             assert_eq!(mcp.len(), 4);
+            let deletion = records.iter().find(|r| r.path == "mcp_delete").unwrap();
+            assert_eq!(deletion.headers["mcp-session-id"], "fixture-session");
+            assert_eq!(deletion.headers["user-agent"], USER_AGENT);
             for (i, r) in mcp.iter().enumerate() {
                 assert_eq!(r.headers["user-agent"], USER_AGENT);
                 assert_eq!(r.headers["mcp-protocol-version"], PROTOCOL);
@@ -343,7 +360,14 @@ async fn provider_and_protocol_errors_stop_both_handlers_without_inference() {
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|r| r.path == "mcp"));
+                .all(|r| r.path.starts_with("mcp")));
+            assert!(f
+                .service
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.path == "mcp_delete"));
         }
     }
 }
@@ -366,7 +390,8 @@ async fn timeout_and_caller_cancellation_stop_before_model_inference() {
             .lock()
             .unwrap()
             .iter()
-            .all(|r| r.path == "mcp"));
+            .all(|r| r.path.starts_with("mcp")));
+        wait_for_deletions(&f, 1).await;
         let state = super::tests::state(&f);
         assert!(tokio::time::timeout(
             Duration::from_millis(100),
@@ -380,7 +405,70 @@ async fn timeout_and_caller_cancellation_stop_before_model_inference() {
             .lock()
             .unwrap()
             .iter()
-            .all(|r| r.path == "mcp"));
+            .all(|r| r.path.starts_with("mcp")));
+        wait_for_deletions(&f, 2).await;
+        let records = f.service.records.lock().unwrap();
+        let cancels: Vec<_> = records
+            .iter()
+            .filter(|r| r.body["method"] == "notifications/cancelled")
+            .collect();
+        assert_eq!(cancels.len(), 2);
+        assert!(cancels.iter().all(|r| r.body["params"]["requestId"] == 3));
+    }
+}
+
+async fn wait_for_deletions(f: &Fixture, count: usize) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if f.service
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.path == "mcp_delete")
+                .count()
+                >= count
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("bounded cleanup must terminate the session");
+}
+
+#[tokio::test]
+async fn failed_handshakes_terminate_sessions_received_in_response_headers() {
+    for behavior in [11, 12] {
+        let f = fixture().await;
+        f.service.behavior.store(behavior, Ordering::SeqCst);
+        assert!(run(state(&f), input(false, search())).await.is_err());
+        wait_for_deletions(&f, 1).await;
+        assert!(f
+            .service
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| r.path.starts_with("mcp")));
+    }
+}
+
+#[tokio::test]
+async fn unsupported_or_slow_session_cleanup_preserves_successful_retrieval() {
+    for behavior in [9, 10] {
+        let f = fixture().await;
+        f.service.behavior.store(behavior, Ordering::SeqCst);
+        let answer = tokio::time::timeout(
+            Duration::from_secs(1),
+            run(state(&f), input(false, search())),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(answer.contains("A grounded answer"));
+        wait_for_deletions(&f, 1).await;
     }
 }
 
